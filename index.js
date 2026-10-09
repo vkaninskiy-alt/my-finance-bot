@@ -125,9 +125,18 @@ bot.on("text", async (ctx) => {
 });
 
 bot.action(/^cat:(.+)$/, async (ctx) => {
-  const state = userSteps.get(ctx.from.id); if (!state || state.step !== "awaiting_category") return ctx.answerCbQuery();
-  const cat = cfg.CATEGORIES.find(c => c.id === ctx.match[1]); state.category = cat ? cat.label : "🌀 Другое"; state.step = "awaiting_comment";
-  await ctx.answerCbQuery(); await ctx.editMessageText("📝 *Введите комментарий к трате или пропустите этот шаг:*", md(cfg.commentInline));
+  const state = userSteps.get(ctx.from.id); 
+  if (!state || state.step !== "awaiting_category") return ctx.answerCbQuery();
+  
+  // ИСПРАВЛЕНИЕ: Используем ctx.match напрямую (без [1]), так как Telegraf возвращает строку!
+  const categoryId = ctx.match[1] || ctx.match; 
+  const cat = cfg.CATEGORIES.find(c => c.id === categoryId); 
+  
+  state.category = cat ? cat.label : "🌀 Иные расходы"; 
+  state.step = "awaiting_comment";
+  
+  await ctx.answerCbQuery(); 
+  await ctx.editMessageText("📝 *Введите комментарий к трате или пропустите этот шаг:*", md(cfg.commentInline));
 });
 
 bot.action("edit_limit_prompt", async (ctx) => { await ctx.answerCbQuery(); userSteps.set(ctx.from.id, { step: "awaiting_limit" }); await ctx.editMessageText("💰 *Введите сумму нового месячного лимита (только число):*", md(cfg.cancelInline)); });
@@ -152,7 +161,17 @@ bot.action(/^delete_(\d+)$/, async (ctx) => {
 
 bot.start((ctx) => ctx.reply(cfg.START_TEXT, md(cfg.menuKeyboard)));
 
-initDb().then(() => bot.launch()).then(() => console.log("Бот запущен!")).catch(e => console.error(e));
+function initDb() {
+  return Promise.all([
+    dbRun("CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, comment TEXT, user_name TEXT, date TEXT)"),
+    dbRun("CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, monthly_limit REAL, group_code TEXT)")
+  ]).then(() => {
+    // ХАК ДЛЯ QA: Принудительно добавляем колонку user_name, если база данных была создана раньше
+    return dbRun("ALTER TABLE expenses ADD COLUMN user_name TEXT").catch(() => {
+      // Игнорируем ошибку, если колонка уже существует
+    });
+  });
+}
 http.createServer((req, res) => { res.writeHead(200); res.end("Live"); }).listen(process.env.PORT || 3000);
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
