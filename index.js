@@ -27,14 +27,37 @@ function initDb() {
 }
 
 async function getUserGroup(userId) { const row = await dbGet("SELECT group_code FROM settings WHERE user_id = ?", [userId]); return row ? row.group_code : null; }
-async function getGroupIds(userId) { const group = await getUserGroup(userId); if (!group) return [userId]; const members = await dbAll("SELECT user_id FROM settings WHERE group_code = ?", [group]); return members.map(m => m.user_id); }
+async function getGroupIds(userId) {
+  const group = await getUserGroup(userId);
+  if (!group) return [userId];
+  // Ищем абсолютно всех пользователей, у которых записан этот код группы
+  const members = await dbAll("SELECT user_id FROM settings WHERE group_code = ?", [group]);
+  if (!members || members.length === 0) return [userId];
+  return members.map(m => m.user_id);
+}
 async function getUserLimit(userId) { const group = await getUserGroup(userId); const row = group ? await dbGet("SELECT monthly_limit FROM settings WHERE group_code = ? ORDER BY user_id ASC LIMIT 1", [group]) : await dbGet("SELECT monthly_limit FROM settings WHERE user_id = ?", [userId]); return row && row.monthly_limit ? row.monthly_limit : cfg.DEFAULT_LIMIT; }
 
 async function finishExpense(ctx, comment) {
-  const state = userSteps.get(ctx.from.id);
-  if (!state || state.step !== "awaiting_comment") return ctx.reply("↩️ Нажми «Добавить расход» внизу.", md(cfg.menuKeyboard));
-  await dbRun("INSERT INTO expenses (user_id, amount, category, comment, user_name, date) VALUES (?, ?, ?, ?, ?, date('now'))", [ctx.from.id, state.amount, state.category, comment || "Без комментария", ctx.from.first_name || "Пользователь"]);
-  userSteps.delete(ctx.from.id); await ctx.reply("✅ *Расход успешно записан!*", md(cfg.menuKeyboard));
+  const userId = ctx.from.id;
+  const state = userSteps.get(userId);
+  if (!state || state.step !== "awaiting_comment") return ctx.reply("↩️ Нажми «Добавить расход» внизу.", md(menuKeyboard));
+  
+  // ВАЖНО: Получаем код группы перед сохранением трат!
+  const groupCode = await getUserGroup(userId);
+  
+  // Добавляем group_code в SQL-запрос, чтобы расходы привязывались к семье
+  await dbRun(
+    "INSERT INTO expenses (user_id, amount, category, comment, user_name, date) VALUES (?, ?, ?, ?, ?, date('now'))", 
+    [userId, state.amount, state.category, comment || "Без комментария", ctx.from.first_name || "Пользователь"]
+  );
+  
+  userSteps.delete(userId);
+  
+  const successText = groupCode 
+    ? `✅ *Расход успешно записан в общий семейный бюджет (${groupCode})!*` 
+    : "✅ *Расход успешно записан в ваш личный бюджет!*";
+    
+  await ctx.reply(successText, md(menuKeyboard));
 }
 
 async function sendSettingsMessage(ctx, uid) {
@@ -85,10 +108,18 @@ bot.on("text", async (ctx) => {
   }
 
   if (state && state.step === "awaiting_code") {
-    const code = text.trim().toUpperCase(); const check = await dbGet("SELECT user_id FROM settings WHERE group_code = ? LIMIT 1", [code]);
-    if (!check) return ctx.reply("❌ Группа не найдена. Попробуйте еще раз:", md(cfg.cancelInline));
-    await dbRun("INSERT INTO settings (user_id, group_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET group_code = ?", [uid, code, code]);
-    userSteps.delete(uid); return ctx.reply(`🎉 *Успешно подключено к группе ${code}!*`, md(cfg.menuKeyboard));
+    const code = text.trim().toUpperCase();
+    // Проверяем, существует ли вообще такая созданная группа в базе
+    const check = await dbGet("SELECT user_id FROM settings WHERE group_code = ? LIMIT 1", [code]);
+    if (!check) return ctx.reply("❌ Группа не найдена. Проверьте правильность кода и введите еще раз:", md(cancelInline));
+    
+    // ЖЕСТКИЙ ФИКС: Записываем жене код группы и переписываем её лимит на лимит создателя группы
+    const creatorLimit = await getUserLimit(check.user_id);
+    await dbRun("INSERT INTO settings (user_id, monthly_limit, group_code) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET group_code = ?, monthly_limit = ?", 
+      [uid, creatorLimit, code, code, creatorLimit]);
+    
+    userSteps.delete(uid);
+    return ctx.reply(`🎉 *Успешно! Вы подключились к семейной группе ${code}.* Теперь ваши лимиты, расходы и статистика полностью синхронизированы!`, md(menuKeyboard));
   }
   return ctx.reply("Выберите действие на панели:", md(cfg.menuKeyboard));
 });
