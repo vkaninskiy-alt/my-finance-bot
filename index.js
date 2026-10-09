@@ -22,7 +22,7 @@ function dbGet(sql, params = []) { return new Promise((res, rej) => db.get(sql, 
 function initDb() {
   return Promise.all([
     dbRun("CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, comment TEXT, user_name TEXT, date TEXT)"),
-    dbRun("CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, monthly_limit REAL, group_code TEXT)")
+    dbRun("CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, monthly_limit REAL, group_code TEXT, group_code_created_at TEXT)")
   ]);
 }
 
@@ -91,12 +91,28 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  if (state && state.step === "awaiting_amount") {
-    const amt = parseFloat(text.replace(",", ".")); if (isNaN(amt) || amt <= 0) return ctx.reply("⚠️ Введите корректное положительное число:");
-    state.amount = amt; state.step = "awaiting_category"; const rows = [];
-    for (let i = 0; i < cfg.CATEGORIES.length; i += 2) rows.push(cfg.CATEGORIES.slice(i, i + 2).map(c => Markup.button.callback(c.label, `cat:${c.id}`)));
-    rows.push([Markup.button.callback("❌ Отмена", "cancel_action")]);
-    return ctx.reply(`🗂 Сумма *${formatAmount(amt)}* принята. Выберите категорию:`, md(Markup.inlineKeyboard(rows)));
+  if (state && state.step === "awaiting_code") {
+    const code = text.trim().toUpperCase();
+    // Извлекаем код группы и время его создания
+    const check = await dbGet("SELECT user_id, group_code_created_at FROM settings WHERE group_code = ? LIMIT 1", [code]);
+    
+    if (!check) return ctx.reply("❌ Ошибка! Код не найден или введен неверно. Попробуйте еще раз:", md(cfg.cancelInline));
+    
+    // ПРОВЕРКА БЕЗОПАСНОСТИ: Проверяем, не истекли ли 15 минут (15 * 60 * 1000 мс)
+    const createdAt = new Date(check.group_code_created_at).getTime();
+    const now = new Date().getTime();
+    const minutesPassed = (now - createdAt) / (1000 * 60);
+
+    if (minutesPassed > 15) {
+      return ctx.reply("⚠️ Срок действия этого кода безопасности (15 минут) истек! Пожалуйста, попросите партнера сгенерировать новый код.", md(cfg.menuKeyboard));
+    }
+    
+    const creatorLimit = await getUserLimit(check.user_id);
+    await dbRun("INSERT INTO settings (user_id, monthly_limit, group_code) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET group_code = ?, monthly_limit = ?", 
+      [uid, creatorLimit, code, code, creatorLimit]);
+    
+    userSteps.delete(uid);
+    return ctx.reply(`🎉 *Успешно! Безопасное подключение выполнено.* Код группы ${code} подтвержден. Бюджет синхронизирован!`, md(cfg.menuKeyboard));
   }
 
   if (state && state.step === "awaiting_limit") {
@@ -144,10 +160,26 @@ bot.action("family_menu", async (ctx) => { await ctx.answerCbQuery(); await ctx.
 bot.action("back_to_settings", async (ctx) => { await ctx.answerCbQuery(); userSteps.delete(ctx.from.id); await sendSettingsMessage(ctx, ctx.from.id); });
 
 bot.action("create_group", async (ctx) => {
-  await ctx.answerCbQuery(); const uid = ctx.from.id; if (await getUserGroup(uid)) return ctx.editMessageText("Вы уже состоите в группе.", md(cfg.menuKeyboard));
-  const code = "FAM-" + Math.floor(1000 + Math.random() * 9000); const currentLimit = await getUserLimit(uid);
-  await dbRun("INSERT INTO settings (user_id, monthly_limit, group_code) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET group_code = ?", [uid, currentLimit, code, code]);
-  await ctx.editMessageText(`🎉 *Семейная группа успешно создана!*\n\n🔑 Ваш код доступа: \`${code}\`\n\nСкопируйте его и отправьте жене. Ей нужно зайти в настройки своего бота, нажать "Войти по коду" и отправить этот код.`, md(cfg.familyInline));
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (await getUserGroup(uid)) return ctx.editMessageText("Вы уже состоите в группе.", md(cfg.menuKeyboard));
+  
+  // Генерация сложного 6-значного буквенно-цифрового кода
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // Исключили похожие O, 0, I, 1
+  let randomCode = "";
+  for (let i = 0; i < 6; i++) {
+    randomCode += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  const secureCode = `FAM-${randomCode}`;
+  const currentLimit = await getUserLimit(uid);
+  const nowIso = new Date().toISOString(); // Фиксируем время создания
+
+  await dbRun(
+    "INSERT INTO settings (user_id, monthly_limit, group_code, group_code_created_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET group_code = ?, group_code_created_at = ?", 
+    [uid, currentLimit, secureCode, nowIso, secureCode, nowIso]
+  );
+  
+  await ctx.editMessageText(`🎉 *Безопасная семейная группа создана!*\n\n🔑 Ваш секретный код: \`\${secureCode}\`\n\n⏰ *Внимание:* Код действует ровно *15 минут*.\nСкопируйте его и отправьте жене. Ей нужно зайти в настройки своего бота, нажать "Войти по коду" и отправить этот код.`, md(cfg.familyInline));
 });
 
 bot.action("join_group_prompt", async (ctx) => { await ctx.answerCbQuery(); userSteps.set(ctx.from.id, { step: "awaiting_code" }); await ctx.editMessageText("🔑 *Введите код семейной группы (например, FAM-1234):*", md(cfg.cancelInline)); });
