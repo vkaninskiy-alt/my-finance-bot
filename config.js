@@ -22,7 +22,7 @@ const menuKeyboard = Markup.keyboard([
 
 const cancelInline = Markup.inlineKeyboard([[Markup.button.callback("❌ Отмена", "cancel_action")]]);
 const commentInline = Markup.inlineKeyboard([[Markup.button.callback("⏭ Пропустить", "skip_comment")], [Markup.button.callback("❌ Отмена", "cancel_action")]]);
-const settingsInline = Markup.inlineKeyboard([[Markup.button.callback("💰 Изменить лимит", "edit_limit_prompt")], [Markup.button.callback("👥 Семейный доступ", "family_menu")]]);
-const familyInline = Markup.inlineKeyboard([[Markup.button.callback("➕ Создать группу", "create_group")], [Markup.button.callback("🔗 Войти по коду", "join_group_prompt")], [Markup.button.callback("⬅️ Назад", "back_to_settings")]]);
+const settingsInline = Markup.inlineKeyboard([[Markup.button.callback("💰 Изменить лимит бюджета", "edit_limit_prompt")], [Markup.button.callback("👥 Семейный доступ", "family_menu")]]);
+const familyInline = Markup.inlineKeyboard([[Markup.button.callback("➕ Создать группу", "create_group")], [Markup.button.callback("🔗 Войти по коду", "join_group_prompt")], [Markup.button.callback("⬅️ Назад в Настройки", "back_to_settings")]]);
 
 module.exports = { CATEGORIES, DIVIDER, DEFAULT_LIMIT, START_TEXT, menuKeyboard, cancelInline, commentInline, settingsInline, familyInline };

@@ -3,7 +3,7 @@ const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
 const { Telegraf, Markup } = require("telegraf");
 const http = require("http");
-const cfg = require("./config"); // Импорт настроек
+const cfg = require("./config");
 
 const token = process.env.BOT_TOKEN;
 if (!token) { console.error("Нет BOT_TOKEN"); process.exit(1); }
@@ -39,7 +39,7 @@ async function finishExpense(ctx, comment) {
 
 async function sendSettingsMessage(ctx, uid) {
   const group = await getUserGroup(uid); const limit = await getUserLimit(uid);
-  const text = `⚙️ *Настройки бюджета*\n\nТекущий статус: ${group ? `👥 Группа: *\${group}*` : "👤 Личный аккаунт"}\nМесячный лимит: *${formatAmount(limit)}*`;
+  const text = `⚙️ *Настройки бюджета*\n\nТекущий статус: ${group ? `👥 Группа: *${group}*` : "👤 Личный аккаунт"}\nМесячный лимит: *${formatAmount(limit)}*\n\nВыберите действие кнопками ниже:`;
   return ctx.callbackQuery ? ctx.editMessageText(text, md(cfg.settingsInline)) : ctx.reply(text, md(cfg.settingsInline));
 }
 
@@ -55,20 +55,21 @@ bot.on("text", async (ctx) => {
     let total = 0; let lines = rows.map(r => { total += r.sum; return `${r.category}: *${formatAmount(r.sum)}*`; }).join("\n");
     if (rows.length === 0) lines = "🌱 *Траты в этом месяце отсутствуют!*";
     const remaining = userLimit - total; const percent = userLimit > 0 ? Math.round((total / userLimit) * 100) : 0;
-    const budgetBlock = `${cfg.DIVIDER}\n💰 Лимит: ${formatAmount(userLimit)}\n${remaining >= 0 ? `📉 Осталось: \${formatAmount(remaining)}` : `⚠️ Превышен на \${formatAmount(Math.abs(remaining))}!`}\n📊 Траты: ${percent}%`;
-    return ctx.reply(`${group ? `🧾 *Семейный отчёт:*` : `🧾 *Ваш отчёт:*`}\n${cfg.DIVIDER}\n${lines}\n${budgetBlock}`, md(cfg.menuKeyboard));
+    const remainingLine = remaining >= 0 ? `📉 Осталось бюджета: ${formatAmount(remaining)}` : `⚠️ Лимит превышен на ${formatAmount(Math.abs(remaining))}!`;
+    const budgetBlock = `${cfg.DIVIDER}\n💰 Месячный лимит: ${formatAmount(userLimit)}\n${remainingLine}\n📊 Расходовано: ${percent}% от бюджета`;
+    return ctx.reply(`${group ? `🧾 *Семейный отчёт за месяц:*` : `🧾 *Ваш отчёт за месяц:*`}\n${cfg.DIVIDER}\n${lines}\n${budgetBlock}`, md(cfg.menuKeyboard));
   }
 
   if (text === "📜 История и удаление") {
     const ids = await getGroupIds(uid); const rows = await dbAll(`SELECT id, amount, category, comment, user_name FROM expenses WHERE user_id IN (${ids.join(",")}) ORDER BY id DESC LIMIT 5`);
-    if (rows.length === 0) return ctx.reply("🌱 История трат пуста.", md(cfg.menuKeyboard));
+    if (rows.length === 0) return ctx.reply("🌱 История трат пуста.", md(menuKeyboard));
     await ctx.reply("📋 *Последние 5 расходов:*", md());
     for (const r of rows) await ctx.reply(`🧾 *${r.category}*\nСумма: *${formatAmount(r.amount)}*\n✍️ Кто: ${r.user_name}\n📝 ${r.comment}`, md(Markup.inlineKeyboard([[Markup.button.callback("🗑 Удалить", `delete_${r.id}`)]])));
     return;
   }
 
   if (state && state.step === "awaiting_amount") {
-    const amt = parseFloat(text.replace(",", ".")); if (isNaN(amt) || amt <= 0) return ctx.reply("⚠️ Введите число:");
+    const amt = parseFloat(text.replace(",", ".")); if (isNaN(amt) || amt <= 0) return ctx.reply("⚠️ Введите корректное положительное число:");
     state.amount = amt; state.step = "awaiting_category"; const rows = [];
     for (let i = 0; i < cfg.CATEGORIES.length; i += 2) rows.push(cfg.CATEGORIES.slice(i, i + 2).map(c => Markup.button.callback(c.label, `cat:${c.id}`)));
     rows.push([Markup.button.callback("❌ Отмена", "cancel_action")]);
@@ -76,11 +77,11 @@ bot.on("text", async (ctx) => {
   }
 
   if (state && state.step === "awaiting_limit") {
-    const amt = parseFloat(text.replace(",", ".")); if (isNaN(amt) || amt <= 0) return ctx.reply("⚠️ Введите число:");
+    const amt = parseFloat(text.replace(",", ".")); if (isNaN(amt) || amt <= 0) return ctx.reply("⚠️ Введите число для лимита:");
     const group = await getUserGroup(uid);
     await dbRun("INSERT INTO settings (user_id, monthly_limit) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET monthly_limit = ?", [uid, amt, amt]);
     if (group) await dbRun("UPDATE settings SET monthly_limit = ? WHERE group_code = ?", [amt, group]);
-    userSteps.delete(uid); return ctx.reply(`🎉 *Новый месячный лимит в размере ${formatAmount(amt)} сохранен!*`, md(cfg.menuKeyboard));
+    userSteps.delete(uid); return ctx.reply(`🎉 *Новый месячный лимит в размере ${formatAmount(amt)} успешно сохранен!*`, md(cfg.menuKeyboard));
   }
 
   if (state && state.step === "awaiting_code") {
@@ -89,30 +90,36 @@ bot.on("text", async (ctx) => {
     await dbRun("INSERT INTO settings (user_id, group_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET group_code = ?", [uid, code, code]);
     userSteps.delete(uid); return ctx.reply(`🎉 *Успешно подключено к группе ${code}!*`, md(cfg.menuKeyboard));
   }
-  return ctx.reply("Выберите действие:", md(cfg.menuKeyboard));
+  return ctx.reply("Выберите действие на панели:", md(cfg.menuKeyboard));
 });
 
-bot.action(/^cat:(.+)\$/, async (ctx) => {
+bot.action(/^cat:(.+)$/, async (ctx) => {
   const state = userSteps.get(ctx.from.id); if (!state || state.step !== "awaiting_category") return ctx.answerCbQuery();
   const cat = cfg.CATEGORIES.find(c => c.id === ctx.match[1]); state.category = cat ? cat.label : "🌀 Другое"; state.step = "awaiting_comment";
-  await ctx.answerCbQuery(); await ctx.editMessageText("📝 *Введите комментарий или пропустите этот шаг:*", md(cfg.commentInline));
+  await ctx.answerCbQuery(); await ctx.editMessageText("📝 *Введите комментарий к трате или пропустите этот шаг:*", md(cfg.commentInline));
 });
 
-bot.action("edit_limit_prompt", async (ctx) => { await ctx.answerCbQuery(); userSteps.set(ctx.from.id, { step: "awaiting_limit" }); await ctx.editMessageText("💰 *Введите новый месячный лимит (только число):*", md(cfg.cancelInline)); });
+bot.action("edit_limit_prompt", async (ctx) => { await ctx.answerCbQuery(); userSteps.set(ctx.from.id, { step: "awaiting_limit" }); await ctx.editMessageText("💰 *Введите сумму нового месячного лимита (только число):*", md(cfg.cancelInline)); });
 bot.action("family_menu", async (ctx) => { await ctx.answerCbQuery(); await ctx.editMessageText("👥 *Семейный доступ*\n\nСоздайте группу и передайте код жене, либо войдите по её коду:", md(cfg.familyInline)); });
 bot.action("back_to_settings", async (ctx) => { await ctx.answerCbQuery(); userSteps.delete(ctx.from.id); await sendSettingsMessage(ctx, ctx.from.id); });
 
 bot.action("create_group", async (ctx) => {
-  await ctx.answerCbQuery(); const uid = ctx.from.id; if (await getUserGroup(uid)) return ctx.editMessageText("Вы уже в группе.", md(cfg.menuKeyboard));
+  await ctx.answerCbQuery(); const uid = ctx.from.id; if (await getUserGroup(uid)) return ctx.editMessageText("Вы уже состоите в группе.", md(cfg.menuKeyboard));
   const code = "FAM-" + Math.floor(1000 + Math.random() * 9000); const currentLimit = await getUserLimit(uid);
   await dbRun("INSERT INTO settings (user_id, monthly_limit, group_code) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET group_code = ?", [uid, currentLimit, code, code]);
-  await ctx.editMessageText(`🎉 *Группа создана!*\n🔑 Код доступа: \`\${code}\`\n\nОтправьте его жене.`, md(cfg.familyInline));
+  await ctx.editMessageText(`🎉 *Семейная группа успешно создана!*\n\n🔑 Ваш код доступа: \`${code}\`\n\nСкопируйте его и отправьте жене. Ей нужно зайти в настройки своего бота, нажать "Войти по коду" и отправить этот код.`, md(cfg.familyInline));
 });
 
 bot.action("join_group_prompt", async (ctx) => { await ctx.answerCbQuery(); userSteps.set(ctx.from.id, { step: "awaiting_code" }); await ctx.editMessageText("🔑 *Введите код семейной группы (например, FAM-1234):*", md(cfg.cancelInline)); });
 bot.action("skip_comment", async (ctx) => { await ctx.answerCbQuery(); await finishExpense(ctx, "Без комментария"); });
-bot.action("cancel_action", async (ctx) => { userSteps.delete(ctx.from.id); await ctx.answerCbQuery(); ctx.reply("Действие отменено.", md(cfg.menuKeyboard)); });
-bot.action(/^delete_(\d+)\$/, async (ctx) => { await dbRun("DELETE FROM expenses WHERE id = ?", [ctx.match[1]]); await ctx.answerCbQuery("Удалено!"); await ctx.editMessageText("❌ *Расход удален.*", md()); });
+bot.action("cancel_action", async (ctx) => { userSteps.delete(ctx.from.id); await ctx.answerCbQuery(); await ctx.reply("Действие отменено.", md(cfg.menuKeyboard)); });
+
+bot.action(/^delete_(\d+)$/, async (ctx) => {
+  await dbRun("DELETE FROM expenses WHERE id = ?", [ctx.match[1]]);
+  await ctx.answerCbQuery("Удалено!"); await ctx.editMessageText("❌ *Расход успешно удален.*", md());
+});
+
+bot.start((ctx) => ctx.reply(cfg.START_TEXT, md(cfg.menuKeyboard)));
 
 initDb().then(() => bot.launch()).then(() => console.log("Бот запущен!")).catch(e => console.error(e));
 http.createServer((req, res) => { res.writeHead(200); res.end("Live"); }).listen(process.env.PORT || 3000);
