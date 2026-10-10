@@ -26,7 +26,7 @@ const userSteps = new Map();
 
 const MAX_AMOUNT = 1_000_000_000;
 const MAX_COMMENT_LENGTH = 1000;
-const MAX_GROUP_MEMBERS = 2;
+const MAX_GROUP_MEMBERS = 10;
 const GROUP_CODE_TTL = 15 * 60 * 1000;
 const APP_TIMEZONE = process.env.APP_TIMEZONE || "UTC";
 
@@ -137,6 +137,12 @@ async function initDb() {
   }
   if (!columnNames.has("group_id")) {
     await dbRun("ALTER TABLE settings ADD COLUMN group_id TEXT");
+  }
+  if (!columnNames.has("first_name")) {
+    await dbRun("ALTER TABLE settings ADD COLUMN first_name TEXT");
+  }
+  if (!columnNames.has("username")) {
+    await dbRun("ALTER TABLE settings ADD COLUMN username TEXT");
   }
 
   await dbRun(`CREATE TABLE IF NOT EXISTS family_groups (
@@ -427,9 +433,11 @@ async function createFamilyGroup(ctx) {
     if (await getUserGroup(userId)) throw new Error("Пользователь уже состоит в группе");
     await dbRun("INSERT INTO family_groups (group_id, invite_code, invite_created_at, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
       [groupId, inviteCode, createdAt, userId, createdAt]);
-    await dbRun(`INSERT INTO settings (user_id, monthly_limit, group_id)
-      VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET monthly_limit = excluded.monthly_limit, group_id = excluded.group_id`,
-      [userId, limit, groupId]);
+    await dbRun(`INSERT INTO settings (user_id, monthly_limit, group_id, first_name, username)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+      monthly_limit = excluded.monthly_limit, group_id = excluded.group_id,
+      first_name = excluded.first_name, username = excluded.username`,
+      [userId, limit, groupId, ctx.from.first_name || "Участник", ctx.from.username || null]);
   });
   return ctx.editMessageText(`🎉 *Семейная группа создана!*\n\n🔑 Код приглашения: \`${inviteCode}\`\n\n⏰ Код действует 15 минут. Передай его партнёру.`, md(cfg.familyInline));
 }
@@ -458,9 +466,11 @@ async function joinFamilyGroup(ctx, rawCode) {
       if (members.length >= MAX_GROUP_MEMBERS) return { error: "GROUP_FULL" };
       const creator = await dbGet("SELECT monthly_limit FROM settings WHERE user_id = ?", [invite.created_by]);
       const limit = Number(creator?.monthly_limit) > 0 ? Number(creator.monthly_limit) : cfg.DEFAULT_LIMIT;
-      await dbRun(`INSERT INTO settings (user_id, monthly_limit, group_id)
-        VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET monthly_limit = excluded.monthly_limit, group_id = excluded.group_id`,
-        [userId, limit, invite.group_id]);
+      await dbRun(`INSERT INTO settings (user_id, monthly_limit, group_id, first_name, username)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+        monthly_limit = excluded.monthly_limit, group_id = excluded.group_id,
+        first_name = excluded.first_name, username = excluded.username`,
+        [userId, limit, invite.group_id, ctx.from.first_name || "Участник", ctx.from.username || null]);
       await dbRun("UPDATE settings SET monthly_limit = ? WHERE group_id = ? OR group_code = ?", [limit, invite.group_id, invite.group_id]);
       // Invites are single-use; the family group remains active through group_id.
       await dbRun("UPDATE family_groups SET invite_code = NULL, invite_created_at = NULL WHERE group_id = ?", [invite.group_id]);
@@ -497,7 +507,10 @@ async function leaveFamilyGroup(ctx) {
   return ctx.editMessageText("Ты вышел из семейной группы. История расходов сохранена у авторов записей.", md(cfg.familyInline));
 }
 
-bot.start(async (ctx) => ctx.reply(cfg.START_TEXT, md(cfg.menuKeyboard)));
+bot.start(async (ctx) => {
+  userSteps.delete(ctx.from.id);
+  return ctx.reply(cfg.START_TEXT, md(cfg.menuKeyboard));
+});
 
 bot.on("photo", async (ctx) => handleReceiptPhoto(ctx));
 
@@ -711,14 +724,121 @@ bot.action("edit_limit_prompt", async (ctx) => {
   return ctx.editMessageText("💰 *Введи сумму нового месячного лимита:*", md(cfg.cancelInline));
 });
 
+async function sendFamilyMembers(ctx, edit = false) {
+  const userId = ctx.from.id;
+  const groupId = await getUserGroup(userId);
+  if (!groupId) {
+    const text = "👥 *Семейная группа*\n\nСоздай группу или войди по коду приглашения.";
+    return edit && ctx.callbackQuery
+      ? ctx.editMessageText(text, md(cfg.familyInline))
+      : ctx.reply(text, md(cfg.familyInline));
+  }
+
+  const group = await dbGet("SELECT created_by, invite_code FROM family_groups WHERE group_id = ?", [groupId]);
+  const members = await dbAll(
+    "SELECT user_id, first_name, username FROM settings WHERE group_id = ? OR group_code = ? ORDER BY user_id",
+    [groupId, groupId]
+  );
+  const isCreator = Number(group?.created_by) === Number(userId);
+  const lines = members.map((member, i) => {
+    const displayName = member.first_name || `Участник ${i + 1}`;
+    const username = member.username ? ` (@${member.username})` : "";
+    const role = Number(member.user_id) === Number(group?.created_by) ? " — создатель" : "";
+    return `${i + 1}. ${escapeMd(displayName)}${escapeMd(username)}${role}`;
+  });
+  const text = `👥 *Участники семейной группы*\n\n${lines.join("\n") || "Участники не найдены."}\n\nУчастников: *${members.length}/${MAX_GROUP_MEMBERS}*`;
+  const rows = [];
+  if (isCreator && members.length < MAX_GROUP_MEMBERS) {
+    rows.push([Markup.button.callback("➕ Пригласить участника", "group_invite")]);
+  }
+  if (isCreator && members.some((m) => Number(m.user_id) !== Number(userId))) {
+    rows.push([Markup.button.callback("➖ Удалить участника", "group_remove_menu")]);
+  }
+  rows.push([Markup.button.callback("🚪 Покинуть группу", "leave_group")]);
+  rows.push([Markup.button.callback("⬅️ Назад", "family_menu")]);
+  const keyboard = Markup.inlineKeyboard(rows);
+  return edit && ctx.callbackQuery
+    ? ctx.editMessageText(text, md(keyboard))
+    : ctx.reply(text, md(keyboard));
+}
+
 bot.action("family_menu", async (ctx) => {
   await ctx.answerCbQuery();
   const groupId = await getUserGroup(ctx.from.id);
-  const keyboard = groupId ? Markup.inlineKeyboard([
-    [Markup.button.callback("🚪 Покинуть группу", "leave_group")],
-    [Markup.button.callback("⬅️ Назад в настройки", "back_to_settings")]
-  ]) : cfg.familyInline;
-  return ctx.editMessageText("👥 *Семейный доступ*\n\nСоздай группу и передай код партнёру либо войди по коду.", md(keyboard));
+  if (groupId) return sendFamilyMembers(ctx, true);
+  return ctx.editMessageText(
+    "👥 *Семейный доступ*\n\nСоздай группу и передай код приглашения либо войди по коду партнёра.",
+    md(cfg.familyInline)
+  );
+});
+
+bot.action("group_invite", async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const groupId = await getUserGroup(userId);
+  if (!groupId) return ctx.editMessageText("Ты не состоишь в семейной группе.", md(cfg.familyInline));
+  const group = await dbGet("SELECT created_by FROM family_groups WHERE group_id = ?", [groupId]);
+  if (Number(group?.created_by) !== Number(userId)) {
+    return ctx.answerCbQuery("Только создатель группы может приглашать участников.", { show_alert: true });
+  }
+  const members = await dbAll("SELECT user_id FROM settings WHERE group_id = ? OR group_code = ?", [groupId, groupId]);
+  if (members.length >= MAX_GROUP_MEMBERS) {
+    return ctx.editMessageText(`Достигнут лимит участников: ${MAX_GROUP_MEMBERS}.`, md(Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ К участникам", "family_menu")]
+    ])));
+  }
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const suffix = Array.from({ length: 6 }, () => chars[crypto.randomInt(chars.length)]).join("");
+  const inviteCode = `FAM-${suffix}`;
+  const createdAt = new Date().toISOString();
+  await dbRun("UPDATE family_groups SET invite_code = ?, invite_created_at = ? WHERE group_id = ?", [inviteCode, createdAt, groupId]);
+  return ctx.editMessageText(
+    `🔗 *Приглашение в семейную группу*\n\nКод: \`${inviteCode}\`\n\nКод действует 15 минут. Передай его человеку, которого хочешь добавить. После использования можно создать новый код.`,
+    md(Markup.inlineKeyboard([[Markup.button.callback("⬅️ К участникам", "family_menu")]]))
+  );
+});
+
+bot.action("group_remove_menu", async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const groupId = await getUserGroup(userId);
+  const group = groupId ? await dbGet("SELECT created_by FROM family_groups WHERE group_id = ?", [groupId]) : null;
+  if (!groupId || Number(group?.created_by) !== Number(userId)) {
+    return ctx.answerCbQuery("Удалять участников может только создатель группы.", { show_alert: true });
+  }
+  const members = await dbAll(
+    "SELECT user_id, first_name, username FROM settings WHERE (group_id = ? OR group_code = ?) AND user_id != ? ORDER BY user_id",
+    [groupId, groupId, userId]
+  );
+  if (!members.length) {
+    return ctx.editMessageText("В группе нет других участников.", md(Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ К участникам", "family_menu")]
+    ])));
+  }
+  const rows = members.map((member) => [
+    Markup.button.callback(
+      `🗑 ${String(member.first_name || "Участник").slice(0, 24)}${member.username ? ` (@${member.username})` : ""}`.slice(0, 60),
+      `remove_member_${member.user_id}`
+    )
+  ]);
+  rows.push([Markup.button.callback("⬅️ Назад", "family_menu")]);
+  return ctx.editMessageText("Выбери участника, которого нужно удалить из семейной группы. Его прошлые расходы останутся в истории.", md(Markup.inlineKeyboard(rows)));
+});
+
+bot.action(/^remove_member_(\d+)$/, async (ctx) => {
+  const userId = ctx.from.id;
+  const memberId = Number(ctx.match[1]);
+  const groupId = await getUserGroup(userId);
+  const group = groupId ? await dbGet("SELECT created_by FROM family_groups WHERE group_id = ?", [groupId]) : null;
+  if (!groupId || Number(group?.created_by) !== Number(userId)) {
+    return ctx.answerCbQuery("Только создатель группы может удалять участников.", { show_alert: true });
+  }
+  if (memberId === userId) return ctx.answerCbQuery("Нельзя удалить самого себя этой кнопкой. Используй «Покинуть группу».", { show_alert: true });
+  const member = await dbGet("SELECT user_id FROM settings WHERE user_id = ? AND (group_id = ? OR group_code = ?)", [memberId, groupId, groupId]);
+  if (!member) return ctx.answerCbQuery("Участник уже не состоит в группе.", { show_alert: true });
+  await dbRun("UPDATE settings SET group_id = NULL, group_code = NULL, group_code_created_at = NULL WHERE user_id = ?", [memberId]);
+  await ctx.answerCbQuery("Участник удалён");
+  return sendFamilyMembers(ctx, true);
 });
 
 bot.action("back_to_settings", async (ctx) => {
