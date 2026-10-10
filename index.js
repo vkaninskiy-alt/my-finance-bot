@@ -274,7 +274,7 @@ async function finishExpense(ctx, comment) {
   const groupId = await getUserGroup(userId);
   userSteps.delete(userId);
   return ctx.reply(groupId
-    ? `✅ *Расход записан в общий семейный бюджет (${escapeMd(groupId)})!*`
+    ? "✅ *Расход записан в общий семейный бюджет!*"
     : "✅ *Расход успешно записан в ваш личный бюджет!*", md(cfg.menuKeyboard));
 }
 
