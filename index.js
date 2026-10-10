@@ -144,6 +144,14 @@ async function initDb() {
   if (!columnNames.has("username")) {
     await dbRun("ALTER TABLE settings ADD COLUMN username TEXT");
   }
+  if (!columnNames.has("personal_limit")) {
+    await dbRun("ALTER TABLE settings ADD COLUMN personal_limit REAL");
+  }
+  if (!columnNames.has("family_limit")) {
+    await dbRun("ALTER TABLE settings ADD COLUMN family_limit REAL");
+  }
+  // Existing monthly_limit values become both personal and family limits for compatibility.
+  await dbRun("UPDATE settings SET personal_limit = COALESCE(personal_limit, monthly_limit), family_limit = COALESCE(family_limit, monthly_limit)");
 
   await dbRun(`CREATE TABLE IF NOT EXISTS family_groups (
     group_id TEXT PRIMARY KEY,
@@ -197,36 +205,50 @@ async function getGroupIds(userId) {
   return ids.length ? ids : [userId];
 }
 
-async function getUserLimit(userId) {
+async function getUserLimit(userId, budgetType = "personal") {
   const groupId = await getUserGroup(userId);
-  const row = groupId
-    ? await dbGet("SELECT monthly_limit FROM settings WHERE COALESCE(group_id, group_code) = ? ORDER BY user_id ASC LIMIT 1", [groupId])
-    : await dbGet("SELECT monthly_limit FROM settings WHERE user_id = ?", [userId]);
-  const limit = Number(row?.monthly_limit);
+  const column = budgetType === "family" ? "family_limit" : "personal_limit";
+  const row = budgetType === "family" && groupId
+    ? await dbGet(`SELECT ${column} AS budget_limit FROM settings WHERE COALESCE(group_id, group_code) = ? ORDER BY user_id ASC LIMIT 1`, [groupId])
+    : await dbGet(`SELECT ${column} AS budget_limit FROM settings WHERE user_id = ?`, [userId]);
+  const limit = Number(row?.budget_limit);
   return Number.isFinite(limit) && limit > 0 ? limit : cfg.DEFAULT_LIMIT;
 }
 
-async function setUserLimit(userId, amount) {
+async function setUserLimit(userId, amount, budgetType = "personal") {
+  const column = budgetType === "family" ? "family_limit" : "personal_limit";
   await withTransaction(async () => {
     const groupId = await getUserGroup(userId);
-    await dbRun(`INSERT INTO settings (user_id, monthly_limit, group_id)
-      VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET monthly_limit = excluded.monthly_limit`,
-    [userId, amount, groupId]);
-    if (groupId) {
-      await dbRun("UPDATE settings SET monthly_limit = ? WHERE COALESCE(group_id, group_code) = ?", [amount, groupId]);
+    await dbRun(`INSERT INTO settings (user_id, monthly_limit, ${column}, group_id)
+      VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET ${column} = excluded.${column}`,
+      [userId, amount, amount, groupId]);
+    if (budgetType === "family" && groupId) {
+      await dbRun(`UPDATE settings SET family_limit = ?, monthly_limit = ? WHERE COALESCE(group_id, group_code) = ?`,
+        [amount, amount, groupId]);
+    } else {
+      await dbRun("UPDATE settings SET monthly_limit = ? WHERE user_id = ?", [amount, userId]);
     }
   });
 }
 
 async function sendSettingsMessage(ctx, userId) {
   const groupId = await getUserGroup(userId);
-  const limit = await getUserLimit(userId);
-  const status = groupId ? `👥 Семейная группа: *${escapeMd(groupId)}*` : "👤 Личный аккаунт";
-  const keyboard = groupId ? Markup.inlineKeyboard([
-    [Markup.button.callback("💰 Изменить лимит бюджета", "edit_limit_prompt")],
-    [Markup.button.callback("👥 Семейный доступ", "family_menu")]
-  ]) : cfg.settingsInline;
-  const message = `⚙️ *Настройки бюджета*\n\nТекущий статус: ${status}\nМесячный лимит: *${formatAmount(limit)}*\n\nВыберите действие кнопками ниже:`;
+  const personalLimit = await getUserLimit(userId, "personal");
+  const familyLimit = groupId ? await getUserLimit(userId, "family") : null;
+  const status = groupId ? "👥 Семейная группа подключена" : "👤 Личный аккаунт";
+  const rows = [
+    [Markup.button.callback("💰 Лимит личного бюджета", "edit_personal_limit")],
+  ];
+  if (groupId) {
+    rows.push([Markup.button.callback("👨‍👩‍👧 Лимит семейного бюджета", "edit_family_limit")]);
+    rows.push([Markup.button.callback("👥 Семейный доступ", "family_menu")]);
+  } else {
+    rows.push([Markup.button.callback("👥 Семейный доступ", "family_menu")]);
+  }
+  const message = `⚙️ *Настройки бюджета*\n\n${status}\n\n👤 Личный лимит: *${formatAmount(personalLimit)}*` +
+    (groupId ? `\n👨‍👩‍👧 Семейный лимит: *${formatAmount(familyLimit)}*` : "\n\nПодключи семейную группу, чтобы настроить отдельный общий лимит.") +
+    "\n\nВыбери, какой лимит изменить:";
+  const keyboard = Markup.inlineKeyboard(rows);
   if (ctx.callbackQuery) return ctx.editMessageText(message, md(keyboard));
   return ctx.reply(message, md(keyboard));
 }
@@ -239,9 +261,23 @@ const PERIODS = {
 
 function statsKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("📅 Сегодня", "stats_today"), Markup.button.callback("📆 7 дней", "stats_week")],
-    [Markup.button.callback("🗓 Месяц", "stats_month")]
+    [Markup.button.callback("📅 Сегодня", "stats_today"), Markup.button.callback("🗓 7 дней", "stats_week")],
+    [Markup.button.callback("📆 Этот месяц", "stats_month")]
   ]);
+}
+
+function budgetMeter(spent, limit) {
+  const safeLimit = Number(limit) > 0 ? Number(limit) : cfg.DEFAULT_LIMIT;
+  const ratio = Number(spent || 0) / safeLimit;
+  const percent = Math.round(ratio * 100);
+  const filled = Math.min(10, Math.max(0, Math.round(ratio * 10)));
+  const block = ratio >= 1 ? "🟥" : "🟩";
+  const bar = block.repeat(filled) + "▫️".repeat(10 - filled);
+  const remaining = safeLimit - Number(spent || 0);
+  const remainderText = remaining >= 0
+    ? `Остаток: *${formatAmount(remaining)}*`
+    : `⚠️ Превышение: *${formatAmount(Math.abs(remaining))}*`;
+  return `Лимит: *${formatAmount(safeLimit)}*\n${bar} *${percent}%*\n${remainderText}`;
 }
 
 async function sendStats(ctx, period = "month", edit = false) {
@@ -249,45 +285,55 @@ async function sendStats(ctx, period = "month", edit = false) {
   const userId = ctx.from.id;
   const groupId = await getUserGroup(userId);
   const ids = await getGroupIds(userId);
-  const limit = await getUserLimit(userId);
   const placeholders = ids.map(() => "?").join(", ");
   const start = periodStart(selected);
   const today = dateInTimezone();
-  const rows = await dbAll(`SELECT category, SUM(amount) AS total FROM expenses
-    WHERE user_id IN (${placeholders}) AND (budget_type = 'family' OR (budget_type = 'personal' AND user_id = ?)) AND date >= ? AND date <= ?
-    GROUP BY category ORDER BY total DESC`, [...ids, userId, start, today]);
-  const total = rows.reduce((sum, row) => sum + Number(row.total || 0), 0);
-  const lines = rows.length
-    ? rows.map((row) => `${escapeMd(row.category)}: *${formatAmount(row.total)}*`).join("\n")
-    : "🌱 *Трат за выбранный период нет.*";
-
-  // The monthly budget is compared only with the current month's spending.
   const monthStart = `${today.slice(0, 7)}-01`;
-  const previousMonthDate = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 2, 1));
-  const previousMonthStart = `${previousMonthDate.getUTCFullYear()}-${String(previousMonthDate.getUTCMonth() + 1).padStart(2, "0")}-01`;
-  const previousMonthEnd = addDays(monthStart, -1);
-  const monthRow = await dbGet(`SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
-    WHERE user_id IN (${placeholders}) AND (budget_type = 'family' OR (budget_type = 'personal' AND user_id = ?)) AND date >= ? AND date <= ?`, [...ids, userId, monthStart, today]);
-  const previousRow = await dbGet(`SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
-    WHERE user_id IN (${placeholders}) AND (budget_type = 'family' OR (budget_type = 'personal' AND user_id = ?)) AND date >= ? AND date <= ?`, [...ids, userId, previousMonthStart, previousMonthEnd]);
-  const monthTotal = Number(monthRow?.total || 0);
-  const previousTotal = Number(previousRow?.total || 0);
-  const remaining = limit - monthTotal;
-  const percent = limit > 0 ? Math.round((monthTotal / limit) * 100) : 0;
-  const remainingText = remaining >= 0
-    ? `Осталось: *${formatAmount(remaining)}*`
-    : `⚠️ Превышение: *${formatAmount(Math.abs(remaining))}*`;
-  const comparison = previousTotal > 0
-    ? (monthTotal <= previousTotal
-      ? `📉 К прошлому месяцу: на ${Math.round((1 - monthTotal / previousTotal) * 100)}% меньше`
-      : `📈 К прошлому месяцу: на ${Math.round((monthTotal / previousTotal - 1) * 100)}% больше`)
-    : "📊 В прошлом месяце расходов не было.";
-  const title = groupId ? "🧾 *Семейный отчёт*" : "🧾 *Ваш отчёт*";
-  const budgetLines = selected === "month"
-    ? `💰 Месячный лимит: *${formatAmount(limit)}*\n${remainingText}\n📊 Использовано: *${percent}%*\n${comparison}`
-    : `💰 Потрачено за период: *${formatAmount(total)}*\nℹ️ Месячный лимит и остаток рассчитываются отдельно за текущий месяц.`;
-  const message = `${title}\n📆 Период: *${PERIODS[selected].label}*\n${cfg.DIVIDER}\n${lines}\n${cfg.DIVIDER}\n` +
-    `💸 Всего за период: *${formatAmount(total)}*\n${budgetLines}`;
+
+  async function getBreakdown(type, dateStart) {
+    const userClause = type === "personal" ? "user_id = ?" : `user_id IN (${placeholders})`;
+    const ownerParams = type === "personal" ? [userId] : ids;
+    const rows = await dbAll(
+      `SELECT category, SUM(amount) AS total
+       FROM expenses
+       WHERE ${userClause} AND budget_type = ? AND date >= ? AND date <= ?
+       GROUP BY category ORDER BY total DESC`,
+      [...ownerParams, type, dateStart, today]
+    );
+    return {
+      total: rows.reduce((sum, row) => sum + Number(row.total || 0), 0),
+      lines: rows.length
+        ? rows.map((row) => `• ${escapeMd(row.category)} — *${formatAmount(row.total)}*`).join("\n")
+        : "🌱 Пока нет расходов за этот период."
+    };
+  }
+
+  const personal = await getBreakdown("personal", start);
+  const personalMonth = await getBreakdown("personal", monthStart);
+  const personalLimit = await getUserLimit(userId, "personal");
+  let family = null;
+  let familyMonth = null;
+  let familyLimit = null;
+  if (groupId) {
+    family = await getBreakdown("family", start);
+    familyMonth = await getBreakdown("family", monthStart);
+    familyLimit = await getUserLimit(userId, "family");
+  }
+
+  let message = `📊 *Твой бюджет*\n📆 ${escapeMd(PERIODS[selected].label)}\n${cfg.DIVIDER}\n\n` +
+    `👤 *ЛИЧНЫЙ БЮДЖЕТ*\n${personal.lines}\n\n` +
+    `💸 Потрачено за период: *${formatAmount(personal.total)}*\n` +
+    `📈 *Лимит за текущий месяц*\n${budgetMeter(personalMonth.total, personalLimit)}`;
+
+  if (groupId && family && familyMonth) {
+    message += `\n\n${cfg.DIVIDER}\n\n👨‍👩‍👧 *СЕМЕЙНЫЙ БЮДЖЕТ*\n${family.lines}\n\n` +
+      `💸 Потрачено за период: *${formatAmount(family.total)}*\n` +
+      `📈 *Лимит за текущий месяц*\n${budgetMeter(familyMonth.total, familyLimit)}`;
+  } else {
+    message += `\n\n${cfg.DIVIDER}\n\n👨‍👩‍👧 *СЕМЕЙНЫЙ БЮДЖЕТ*\n` +
+      `Подключи участников в разделе «👥 Семья», чтобы вести общий бюджет и лимит.`;
+  }
+
   if (edit && ctx.callbackQuery) return ctx.editMessageText(message, md(statsKeyboard()));
   return ctx.reply(message, md(statsKeyboard()));
 }
@@ -520,7 +566,10 @@ bot.on("text", async (ctx) => {
   const state = userSteps.get(userId);
 
   // Quick format: "12,50 продукты хлеб" or "3.50 кофе".
-  if (!state && text !== "➕ Добавить расход" && text !== "📊 Статистика" && text !== "📜 История и удаление" && text !== "⚙️ Настройки") {
+  if (!state && ![
+    "➕ Добавить расход", "📊 Статистика", "📜 История", "📜 История и удаление",
+    "👥 Семья", "⚙️ Настройки"
+  ].includes(text)) {
     const quick = quickExpense(text);
     if (quick) {
       userSteps.set(userId, { step: "awaiting_category", amount: quick.amount, category: quick.category.label, quickDescription: quick.description });
@@ -541,21 +590,30 @@ bot.on("text", async (ctx) => {
 
   if (text === "➕ Добавить расход") {
     userSteps.set(userId, { step: "choosing_expense_input" });
-    return ctx.reply("➕ *Добавление расхода*\n\nВыбери способ:", md(Markup.inlineKeyboard([
+    return ctx.reply("➕ *Добавить расход*\n\nКак удобнее внести покупку?\n\n⌨️ *Вручную* — если знаешь сумму.\n🧾 *По чеку* — я попробую распознать сумму с фотографии.", md(Markup.inlineKeyboard([
       [Markup.button.callback("⌨️ Ввести сумму", "expense_manual_amount")],
-      [Markup.button.callback("🧾 Распознать чек", "expense_scan_receipt")],
-      [Markup.button.callback("❌ Отмена", "cancel_action")]
+      [Markup.button.callback("🧾 Сканировать чек", "expense_scan_receipt")],
+      [Markup.button.callback("✖️ Отмена", "cancel_action")]
     ])));
   }
   if (text === "⚙️ Настройки") {
     userSteps.delete(userId);
     return sendSettingsMessage(ctx, userId);
   }
+  if (text === "👥 Семья") {
+    userSteps.delete(userId);
+    const groupId = await getUserGroup(userId);
+    if (groupId) return sendFamilyMembers(ctx, false);
+    return ctx.reply(
+      "👥 *Семейный бюджет*\n\nСоздай семейную группу и пригласи участников или подключись по коду.",
+      md(cfg.familyInline)
+    );
+  }
   if (text === "📊 Статистика") {
     userSteps.delete(userId);
     return ctx.reply("📊 *Выберите период статистики:*", md(statsKeyboard()));
   }
-  if (text === "📜 История и удаление") {
+  if (text === "📜 История" || text === "📜 История и удаление") {
     userSteps.delete(userId);
     const ids = await getGroupIds(userId);
     const placeholders = ids.map(() => "?").join(", ");
@@ -598,7 +656,7 @@ bot.on("text", async (ctx) => {
     const buttons = cfg.CATEGORIES.map((category) => Markup.button.callback(category.label, `cat:${category.id}`));
     const rows = [];
     for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-    return ctx.reply(`✅ Сумма исправлена: *${formatAmount(amount)}*\nВыбери категорию:`, md(Markup.inlineKeyboard(rows)));
+    return ctx.reply(`✅ Сумма исправлена: *${formatAmount(amount)}*\n\n🏷 *Выбери категорию расходов:*`, md(Markup.inlineKeyboard(rows)));
   }
   if (state?.step === "awaiting_amount") {
     const amount = parseAmount(text);
@@ -613,15 +671,21 @@ bot.on("text", async (ctx) => {
     const buttons = categories.map((category) => Markup.button.callback(category.label, `cat:${category.id}`));
     const keyboard = [];
     for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
-    return ctx.reply(`💰 Сумма: *${formatAmount(amount)}*\n\nВыберите категорию:`, md(Markup.inlineKeyboard(keyboard)));
+    return ctx.reply(`💰 Сумма: *${formatAmount(amount)}*\n\n🏷 *Выбери категорию расходов:*`, md(Markup.inlineKeyboard(keyboard)));
   }
   if (state?.step === "awaiting_comment") return finishExpense(ctx, text);
   if (state?.step === "awaiting_limit") {
     const amount = parseAmount(text);
     if (amount === null) return ctx.reply("⚠️ Введи положительный лимит до 1 000 000 000 ₽.", md(cfg.cancelInline));
-    await setUserLimit(userId, amount);
+    const limitType = state.limitType === "family" ? "family" : "personal";
+    if (limitType === "family" && !(await getUserGroup(userId))) {
+      userSteps.delete(userId);
+      return ctx.reply("⚠️ Ты больше не состоишь в семейной группе. Лимит не изменён.", md(cfg.menuKeyboard));
+    }
+    await setUserLimit(userId, amount, limitType);
     userSteps.delete(userId);
-    return ctx.reply(`🎉 *Месячный лимит сохранён: ${formatAmount(amount)}!*`, md(cfg.menuKeyboard));
+    const label = limitType === "family" ? "семейного" : "личного";
+    return ctx.reply(`🎉 *Месячный лимит ${label} бюджета сохранён: ${formatAmount(amount)}!*`, md(cfg.menuKeyboard));
   }
   if (state?.step === "awaiting_code") return joinFamilyGroup(ctx, text);
   return ctx.reply("Выбери действие на панели:", md(cfg.menuKeyboard));
@@ -636,7 +700,7 @@ bot.action('expense_manual_amount', async (ctx) => {
 bot.action('expense_scan_receipt', async (ctx) => {
   userSteps.set(ctx.from.id, { step: 'awaiting_receipt_photo' });
   await ctx.answerCbQuery();
-  return ctx.editMessageText('🧾 *Отправь фотографию чека следующим сообщением.*\\n\\nСделай фото ровно, без бликов, чтобы были видны итоговая сумма и дата.', md(cfg.cancelInline));
+  return ctx.editMessageText('🧾 *Отправь фотографию чека следующим сообщением.*\n\nСделай фото ровно, без бликов, чтобы были видны итоговая сумма и дата.', md(cfg.cancelInline));
 });
 
 bot.action('receipt_confirm', async (ctx) => {
@@ -650,7 +714,7 @@ bot.action('receipt_confirm', async (ctx) => {
   const buttons = cfg.CATEGORIES.map((category) => Markup.button.callback(category.label, `cat:${category.id}`));
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-  return ctx.editMessageText(`💰 Подтверждённая сумма: *${formatAmount(state.amount)}*\\nВыбери категорию:`, md(Markup.inlineKeyboard(rows)));
+  return ctx.editMessageText(`💰 Подтверждённая сумма: *${formatAmount(state.amount)}*\nВыбери категорию:`, md(Markup.inlineKeyboard(rows)));
 });
 
 bot.action('receipt_edit_amount', async (ctx) => {
@@ -718,11 +782,21 @@ for (const [action, budgetType] of [["budget_personal", "personal"], ["budget_fa
   });
 }
 
-bot.action("edit_limit_prompt", async (ctx) => {
+async function promptLimitChange(ctx, budgetType) {
+  const userId = ctx.from.id;
+  if (budgetType === "family" && !(await getUserGroup(userId))) {
+    await ctx.answerCbQuery("Сначала подключись к семейной группе.", { show_alert: true });
+    return;
+  }
+  userSteps.set(userId, { step: "awaiting_limit", limitType: budgetType });
   await ctx.answerCbQuery();
-  userSteps.set(ctx.from.id, { step: "awaiting_limit" });
-  return ctx.editMessageText("💰 *Введи сумму нового месячного лимита:*", md(cfg.cancelInline));
-});
+  const label = budgetType === "family" ? "семейного" : "личного";
+  return ctx.editMessageText(`💰 *Введи новый месячный лимит ${label} бюджета:*`, md(cfg.cancelInline));
+}
+
+bot.action("edit_limit_prompt", async (ctx) => promptLimitChange(ctx, "personal"));
+bot.action("edit_personal_limit", async (ctx) => promptLimitChange(ctx, "personal"));
+bot.action("edit_family_limit", async (ctx) => promptLimitChange(ctx, "family"));
 
 async function sendFamilyMembers(ctx, edit = false) {
   const userId = ctx.from.id;

@@ -15,11 +15,12 @@ const CATEGORIES = [
 
 const DIVIDER = "──────────────────";
 const DEFAULT_LIMIT = 50000;
-const START_TEXT = "👋 *Привет! Я твой семейный финансовый ассистент.*\n\nЯ помогу вам контролировать бюджет и анализировать траты.\nВы можете объединиться с партнёром в настройках для совместного учета!";
+const START_TEXT = "👋 *Добро пожаловать в Семейный бюджет!*\n\nЗдесь можно записывать расходы, следить за лимитами и сравнивать личные траты с семейными.\n\n👇 Выбери действие в меню. Начни с кнопки «➕ Добавить расход».";
 
 const menuKeyboard = Markup.keyboard([
   ["➕ Добавить расход"],
-  ["📊 Статистика", "📜 История и удаление", "⚙️ Настройки"]
+  ["📊 Статистика", "📜 История"],
+  ["👥 Семья", "⚙️ Настройки"]
 ]).resize();
 
 const cancelInline = Markup.inlineKeyboard([[Markup.button.callback("❌ Отмена", "cancel_action")]]);
@@ -28,13 +29,13 @@ const commentInline = Markup.inlineKeyboard([
   [Markup.button.callback("❌ Отмена", "cancel_action")]
 ]);
 const settingsInline = Markup.inlineKeyboard([
-  [Markup.button.callback("💰 Изменить лимит бюджета", "edit_limit_prompt")],
+  [Markup.button.callback("💰 Личный лимит", "edit_limit_prompt")],
   [Markup.button.callback("👥 Семейный доступ", "family_menu")]
 ]);
 const familyInline = Markup.inlineKeyboard([
   [Markup.button.callback("➕ Создать группу", "create_group")],
   [Markup.button.callback("🔗 Войти по коду", "join_group_prompt")],
-  [Markup.button.callback("⬅️ Назад в Настройки", "back_to_settings")]
+  [Markup.button.callback("⬅️ В настройки", "back_to_settings")]
 ]);
 
 module.exports = {
