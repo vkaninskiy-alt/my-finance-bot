@@ -1,20 +1,25 @@
 {
   "name": "finance-bot",
-  "version": "1.1.0",
-  "description": "Telegram family finance bot",
+  "version": "1.2.0",
+  "description": "Telegram family budget bot with personal/shared expenses and receipt OCR",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "check": "node --check index.js && node --check config.js",
     "test": "node --test"
   },
-  "keywords": ["telegram", "finance", "budget"],
+  "keywords": [
+    "telegram",
+    "finance",
+    "budget"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^18.0.6",
     "sqlite3": "^6.0.1",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "tesseract.js": "^6.0.1"
   }
 }
