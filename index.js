@@ -163,6 +163,9 @@ async function initDb() {
   }
 
   const expenseColumns = await dbAll("PRAGMA table_info(expenses)");
+  if (!expenseColumns.some((column) => column.name === "receipt_file_unique_id")) {
+    await dbRun("ALTER TABLE expenses ADD COLUMN receipt_file_unique_id TEXT");
+  }
   if (!expenseColumns.some((column) => column.name === "budget_type")) {
     await dbRun("ALTER TABLE expenses ADD COLUMN budget_type TEXT NOT NULL DEFAULT 'personal'");
     // Preserve the historical meaning of expenses entered while users were in a family group.
@@ -301,32 +304,88 @@ async function downloadTelegramFile(url, destination) {
   });
 }
 
+function parseReceiptFields(rawText) {
+  const raw = String(rawText || '').replace(/\r/g, '\n');
+  const lines = raw.split('\n').map((line) => line.trim()).filter(Boolean);
+  const totalKeywords = /итого|к\s*оплате|всего|total|amount\s*due|summa|kokku|tasuda/i;
+  const moneyPattern = /(?:€|EUR\s*)?\s*(\d{1,7}(?:[ .]\d{3})*[,.]\d{2})\s*(?:€|EUR)?/i;
+  const candidates = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const match = line.match(moneyPattern);
+    if (!match) continue;
+    const amount = parseAmount(match[1].replace(/[ .](?=\d{3}(?:[,.]|$))/g, '').replace(/\s/g, ''));
+    if (amount === null) continue;
+    const keyword = totalKeywords.test(line);
+    // Give priority to explicitly labelled total lines; avoid blindly choosing the largest item.
+    candidates.push({ amount, score: keyword ? 10 : (/summa|kokku|total/i.test(line) ? 8 : 1), index: i });
+  }
+  candidates.sort((a, b) => b.score - a.score || b.index - a.index);
+  const amount = candidates[0]?.amount ?? null;
+  const dateMatch = raw.match(/\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b/);
+  let date = null;
+  if (dateMatch) {
+    const year = dateMatch[3].length === 2 ? `20${dateMatch[3]}` : dateMatch[3];
+    date = `${year}-${dateMatch[2].padStart(2, '0')}-${dateMatch[1].padStart(2, '0')}`;
+    const parsed = new Date(`${date}T00:00:00Z`);
+    if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) date = null;
+  }
+  const merchant = lines.find((line) => /[a-zа-яёõäöü]{3}/i.test(line) && !totalKeywords.test(line) && !/\d{2}[./-]\d{2}[./-]\d{2,4}/.test(line) && line.length <= 70) || null;
+  return { amount, date, merchant, raw: raw.slice(0, 1000) };
+}
+
 async function handleReceiptPhoto(ctx) {
   const userId = ctx.from.id;
+  const state = userSteps.get(userId);
+  if (!state || state.step !== 'awaiting_receipt_photo') {
+    return ctx.reply('Чтобы распознать чек, нажми «➕ Добавить расход» → «🧾 Распознать чек».', md(cfg.menuKeyboard));
+  }
   const photo = ctx.message.photo?.[ctx.message.photo.length - 1];
-  if (!photo) return;
-  await ctx.reply("🧾 Читаю чек. Это может занять до минуты…");
+  if (!photo) return ctx.reply('Пришли фотографию чека как изображение.');
+  if (photo.file_size && photo.file_size > 10 * 1024 * 1024) {
+    return ctx.reply('Фото слишком большое. Отправь более сжатое изображение.');
+  }
+  const receiptFileUniqueId = photo.file_unique_id || null;
+  if (receiptFileUniqueId) {
+    const duplicate = await dbGet('SELECT id, date FROM expenses WHERE receipt_file_unique_id = ? LIMIT 1', [receiptFileUniqueId]);
+    if (duplicate) {
+      return ctx.reply(`⚠️ Похоже, этот чек уже добавлен (${escapeMd(duplicate.date)}). Чтобы не задвоить расход, я не буду записывать его повторно.`, md(cfg.menuKeyboard));
+    }
+  }
+  await ctx.reply('🧾 Распознаю чек. Это может занять до минуты…');
   const tempPath = path.join(os.tmpdir(), `receipt-${userId}-${Date.now()}.jpg`);
   try {
     const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
     await downloadTelegramFile(fileUrl.href || String(fileUrl), tempPath);
-    const result = await Tesseract.recognize(tempPath, "eng+rus");
-    const raw = String(result.data.text || "");
-    const candidates = [...raw.matchAll(/(?:итого|к оплате|total|сумма|всего)?[^\d]{0,12}(\d{1,7}[,.]\d{2})/gi)]
-      .map((match) => parseAmount(match[1]))
-      .filter((amount) => amount !== null);
-    const amount = candidates.length ? Math.max(...candidates) : null;
-    if (amount === null) {
-      return ctx.reply("Не смог уверенно распознать итоговую сумму. Отправь более чёткое фото или введи сумму вручную через «➕ Добавить расход».", md(cfg.menuKeyboard));
+    const result = await Tesseract.recognize(tempPath, 'eng+rus+est');
+    const parsed = parseReceiptFields(result.data.text);
+    if (parsed.amount === null) {
+      userSteps.set(userId, { step: 'awaiting_amount', receiptText: parsed.raw, receiptMerchant: parsed.merchant, receiptDate: parsed.date });
+      return ctx.reply('Не удалось надёжно определить итоговую сумму. Можешь ввести её вручную — распознанный чек не будет сохранён без подтверждения.', md(Markup.inlineKeyboard([
+        [Markup.button.callback('✏️ Ввести сумму вручную', 'receipt_manual_amount')],
+        [Markup.button.callback('🔄 Попробовать ещё раз', 'receipt_retry')],
+        [Markup.button.callback('❌ Отмена', 'cancel_action')]
+      ])));
     }
-    userSteps.set(userId, { step: "awaiting_category", amount, receiptText: raw.slice(0, 500) });
-    const buttons = cfg.CATEGORIES.map((category) => Markup.button.callback(category.label, `cat:${category.id}`));
-    const rows = [];
-    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-    return ctx.reply(`🧾 Предполагаемая сумма по чеку: *${formatAmount(amount)}*\nПроверь сумму и выбери категорию:`, md(Markup.inlineKeyboard(rows)));
+    userSteps.set(userId, { step: 'awaiting_receipt_review', amount: parsed.amount, receiptText: parsed.raw, receiptMerchant: parsed.merchant, receiptDate: parsed.date, receiptFileUniqueId });
+    const summary = `🧾 *Проверь данные чека*\n\n` +
+      `💰 Сумма: *${formatAmount(parsed.amount)}*\n` +
+      `🏪 Магазин: ${escapeMd(parsed.merchant || 'не распознан')}\n` +
+      `📅 Дата: ${escapeMd(parsed.date || 'не распознана')}\n\n` +
+      `Проверь сумму: OCR может ошибаться. Расход будет сохранён только после подтверждения.`;
+    return ctx.reply(summary, md(Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Всё верно, продолжить', 'receipt_confirm')],
+      [Markup.button.callback('✏️ Исправить сумму', 'receipt_edit_amount')],
+      [Markup.button.callback('🔄 Другой чек', 'receipt_retry')],
+      [Markup.button.callback('❌ Отмена', 'cancel_action')]
+    ])));
   } catch (error) {
-    console.error("Ошибка распознавания чека:", error.message);
-    return ctx.reply("Не удалось обработать чек. Попробуй другое фото или введи сумму вручную.", md(cfg.menuKeyboard));
+    console.error('Ошибка распознавания чека:', error.message);
+    return ctx.reply('Не удалось обработать чек. Попробуй другое фото или введи сумму вручную.', md(Markup.inlineKeyboard([
+      [Markup.button.callback('✏️ Ввести сумму вручную', 'receipt_manual_amount')],
+      [Markup.button.callback('🔄 Попробовать ещё раз', 'receipt_retry')],
+      [Markup.button.callback('❌ Отмена', 'cancel_action')]
+    ])));
   } finally {
     await fs.unlink(tempPath).catch(() => {});
   }
@@ -343,9 +402,9 @@ async function finishExpense(ctx, comment) {
     return ctx.reply("⚠️ Данные расхода некорректны. Попробуй ещё раз.", md(cfg.menuKeyboard));
   }
   const cleanComment = String(comment ?? "").trim().slice(0, MAX_COMMENT_LENGTH) || "Без комментария";
-  await dbRun(`INSERT INTO expenses (user_id, amount, category, comment, user_name, date, budget_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?)`, [userId, state.amount, state.category, cleanComment,
-    String(ctx.from.first_name || "Пользователь").slice(0, 100), dateInTimezone(), state.budgetType === "family" ? "family" : "personal"]);
+  await dbRun(`INSERT INTO expenses (user_id, amount, category, comment, user_name, date, budget_type, receipt_file_unique_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [userId, state.amount, state.category, cleanComment,
+    String(ctx.from.first_name || "Пользователь").slice(0, 100), dateInTimezone(), state.budgetType === "family" ? "family" : "personal", state.receiptFileUniqueId || null]);
   const groupId = await getUserGroup(userId);
   userSteps.delete(userId);
   return ctx.reply(groupId
@@ -468,8 +527,12 @@ bot.on("text", async (ctx) => {
   }
 
   if (text === "➕ Добавить расход") {
-    userSteps.set(userId, { step: "awaiting_amount" });
-    return ctx.reply("💰 *Введи сумму расхода:*", md(cfg.cancelInline));
+    userSteps.set(userId, { step: "choosing_expense_input" });
+    return ctx.reply("➕ *Добавление расхода*\n\nВыбери способ:", md(Markup.inlineKeyboard([
+      [Markup.button.callback("⌨️ Ввести сумму", "expense_manual_amount")],
+      [Markup.button.callback("🧾 Распознать чек", "expense_scan_receipt")],
+      [Markup.button.callback("❌ Отмена", "cancel_action")]
+    ])));
   }
   if (text === "⚙️ Настройки") {
     userSteps.delete(userId);
@@ -514,6 +577,16 @@ bot.on("text", async (ctx) => {
     userSteps.delete(userId);
     return ctx.reply(`✅ Сумма расхода обновлена: *${formatAmount(amount)}*`, md(cfg.menuKeyboard));
   }
+  if (state?.step === "awaiting_receipt_amount") {
+    const amount = parseAmount(text);
+    if (amount === null) return ctx.reply("⚠️ Введи корректную положительную сумму, например 12,50.", md(cfg.cancelInline));
+    state.amount = amount;
+    state.step = "awaiting_category";
+    const buttons = cfg.CATEGORIES.map((category) => Markup.button.callback(category.label, `cat:${category.id}`));
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+    return ctx.reply(`✅ Сумма исправлена: *${formatAmount(amount)}*\nВыбери категорию:`, md(Markup.inlineKeyboard(rows)));
+  }
   if (state?.step === "awaiting_amount") {
     const amount = parseAmount(text);
     if (amount === null) return ctx.reply("⚠️ Введи положительную сумму до 1 000 000 000 ₽. Например: 120 или 120,50.", md(cfg.cancelInline));
@@ -539,6 +612,54 @@ bot.on("text", async (ctx) => {
   }
   if (state?.step === "awaiting_code") return joinFamilyGroup(ctx, text);
   return ctx.reply("Выбери действие на панели:", md(cfg.menuKeyboard));
+});
+
+bot.action('expense_manual_amount', async (ctx) => {
+  userSteps.set(ctx.from.id, { step: 'awaiting_amount' });
+  await ctx.answerCbQuery();
+  return ctx.editMessageText('💰 *Введи сумму расхода:*', md(cfg.cancelInline));
+});
+
+bot.action('expense_scan_receipt', async (ctx) => {
+  userSteps.set(ctx.from.id, { step: 'awaiting_receipt_photo' });
+  await ctx.answerCbQuery();
+  return ctx.editMessageText('🧾 *Отправь фотографию чека следующим сообщением.*\\n\\nСделай фото ровно, без бликов, чтобы были видны итоговая сумма и дата.', md(cfg.cancelInline));
+});
+
+bot.action('receipt_confirm', async (ctx) => {
+  const state = userSteps.get(ctx.from.id);
+  if (!state || state.step !== 'awaiting_receipt_review' || !Number.isFinite(state.amount)) {
+    await ctx.answerCbQuery('Сначала отправь чек заново.', { show_alert: true });
+    return;
+  }
+  state.step = 'awaiting_category';
+  await ctx.answerCbQuery('Данные подтверждены');
+  const buttons = cfg.CATEGORIES.map((category) => Markup.button.callback(category.label, `cat:${category.id}`));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  return ctx.editMessageText(`💰 Подтверждённая сумма: *${formatAmount(state.amount)}*\\nВыбери категорию:`, md(Markup.inlineKeyboard(rows)));
+});
+
+bot.action('receipt_edit_amount', async (ctx) => {
+  const state = userSteps.get(ctx.from.id);
+  if (!state || state.step !== 'awaiting_receipt_review') return ctx.answerCbQuery('Чек не найден. Отправь его заново.');
+  state.step = 'awaiting_receipt_amount';
+  await ctx.answerCbQuery();
+  return ctx.editMessageText(`✏️ Введи правильную сумму. Сейчас распознано: *${formatAmount(state.amount)}*`, md(cfg.cancelInline));
+});
+
+bot.action('receipt_manual_amount', async (ctx) => {
+  const state = userSteps.get(ctx.from.id) || {};
+  state.step = 'awaiting_receipt_amount';
+  userSteps.set(ctx.from.id, state);
+  await ctx.answerCbQuery();
+  return ctx.editMessageText('✏️ Введи итоговую сумму с чека, например 12,50:', md(cfg.cancelInline));
+});
+
+bot.action('receipt_retry', async (ctx) => {
+  userSteps.set(ctx.from.id, { step: 'awaiting_receipt_photo' });
+  await ctx.answerCbQuery();
+  return ctx.editMessageText('📷 Отправь другое, более чёткое фото чека.', md(cfg.cancelInline));
 });
 
 for (const period of Object.keys(PERIODS)) {
@@ -577,7 +698,8 @@ for (const [action, budgetType] of [["budget_personal", "personal"], ["budget_fa
     state.budgetType = budgetType;
     state.step = "awaiting_comment";
     await ctx.answerCbQuery();
-    const comment = state.quickDescription || (state.receiptText ? "Расход по чеку" : "");
+    const receiptLabel = state.receiptText ? `Чек${state.receiptMerchant ? `: ${state.receiptMerchant}` : ""}${state.receiptDate ? `, дата ${state.receiptDate}` : ""}` : "";
+    const comment = state.quickDescription || receiptLabel;
     if (comment) return finishExpense(ctx, comment);
     return ctx.editMessageText("📝 *Введи комментарий к трате или пропусти этот шаг:*", md(cfg.commentInline));
   });
