@@ -5,6 +5,11 @@ require("dotenv").config();
 const path = require("path");
 const crypto = require("crypto");
 const http = require("http");
+const fs = require("fs/promises");
+const os = require("os");
+const https = require("https");
+const Tesseract = require("tesseract.js");
+const { parseAmount, quickExpenseParts } = require("./expense-utils");
 const sqlite3 = require("sqlite3").verbose();
 const { Telegraf, Markup } = require("telegraf");
 const cfg = require("./config");
@@ -40,13 +45,6 @@ function formatAmount(value) {
   return `${Number(value || 0).toLocaleString("ru-RU", {
     maximumFractionDigits: 2
   })} ₽`;
-}
-
-function parseAmount(value) {
-  const normalized = String(value ?? "").trim().replace(/\s/g, "").replace(",", ".");
-  if (!/^\d+(\.\d{1,2})?$/.test(normalized)) return null;
-  const amount = Number(normalized);
-  return Number.isFinite(amount) && amount > 0 && amount <= MAX_AMOUNT ? amount : null;
 }
 
 function dbRun(sql, params = []) {
@@ -164,6 +162,13 @@ async function initDb() {
       VALUES (?, ?, ?, ?, ?)`, [group.group_code, group.group_code, createdAt, creatorId, createdAt]);
   }
 
+  const expenseColumns = await dbAll("PRAGMA table_info(expenses)");
+  if (!expenseColumns.some((column) => column.name === "budget_type")) {
+    await dbRun("ALTER TABLE expenses ADD COLUMN budget_type TEXT NOT NULL DEFAULT 'personal'");
+    // Preserve the historical meaning of expenses entered while users were in a family group.
+    await dbRun(`UPDATE expenses SET budget_type = 'family'
+      WHERE user_id IN (SELECT user_id FROM settings WHERE COALESCE(group_id, group_code) IS NOT NULL)`);
+  }
   await dbRun("CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date)");
   await dbRun("CREATE INDEX IF NOT EXISTS idx_settings_group_id ON settings(group_id)");
   await dbRun("CREATE INDEX IF NOT EXISTS idx_settings_group_code ON settings(group_code)");
@@ -240,8 +245,8 @@ async function sendStats(ctx, period = "month", edit = false) {
   const start = periodStart(selected);
   const today = dateInTimezone();
   const rows = await dbAll(`SELECT category, SUM(amount) AS total FROM expenses
-    WHERE user_id IN (${placeholders}) AND date >= ? AND date <= ?
-    GROUP BY category ORDER BY total DESC`, [...ids, start, today]);
+    WHERE user_id IN (${placeholders}) AND (budget_type = 'family' OR (budget_type = 'personal' AND user_id = ?)) AND date >= ? AND date <= ?
+    GROUP BY category ORDER BY total DESC`, [...ids, userId, start, today]);
   const total = rows.reduce((sum, row) => sum + Number(row.total || 0), 0);
   const lines = rows.length
     ? rows.map((row) => `${escapeMd(row.category)}: *${formatAmount(row.total)}*`).join("\n")
@@ -253,9 +258,9 @@ async function sendStats(ctx, period = "month", edit = false) {
   const previousMonthStart = `${previousMonthDate.getUTCFullYear()}-${String(previousMonthDate.getUTCMonth() + 1).padStart(2, "0")}-01`;
   const previousMonthEnd = addDays(monthStart, -1);
   const monthRow = await dbGet(`SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
-    WHERE user_id IN (${placeholders}) AND date >= ? AND date <= ?`, [...ids, monthStart, today]);
+    WHERE user_id IN (${placeholders}) AND (budget_type = 'family' OR (budget_type = 'personal' AND user_id = ?)) AND date >= ? AND date <= ?`, [...ids, userId, monthStart, today]);
   const previousRow = await dbGet(`SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
-    WHERE user_id IN (${placeholders}) AND date >= ? AND date <= ?`, [...ids, previousMonthStart, previousMonthEnd]);
+    WHERE user_id IN (${placeholders}) AND (budget_type = 'family' OR (budget_type = 'personal' AND user_id = ?)) AND date >= ? AND date <= ?`, [...ids, userId, previousMonthStart, previousMonthEnd]);
   const monthTotal = Number(monthRow?.total || 0);
   const previousTotal = Number(previousRow?.total || 0);
   const remaining = limit - monthTotal;
@@ -278,6 +283,55 @@ async function sendStats(ctx, period = "month", edit = false) {
   return ctx.reply(message, md(statsKeyboard()));
 }
 
+function quickExpense(text) {
+  return quickExpenseParts(text, cfg.CATEGORIES);
+}
+
+async function downloadTelegramFile(url, destination) {
+  await new Promise((resolve, reject) => {
+    const file = require("fs").createWriteStream(destination);
+    https.get(url, (response) => {
+      if (response.statusCode !== 200) {
+        file.close(() => {});
+        return reject(new Error(`Telegram file download failed: ${response.statusCode}`));
+      }
+      response.pipe(file);
+      file.on("finish", () => file.close(resolve));
+    }).on("error", (error) => { file.close(() => {}); reject(error); });
+  });
+}
+
+async function handleReceiptPhoto(ctx) {
+  const userId = ctx.from.id;
+  const photo = ctx.message.photo?.[ctx.message.photo.length - 1];
+  if (!photo) return;
+  await ctx.reply("🧾 Читаю чек. Это может занять до минуты…");
+  const tempPath = path.join(os.tmpdir(), `receipt-${userId}-${Date.now()}.jpg`);
+  try {
+    const fileUrl = await ctx.telegram.getFileLink(photo.file_id);
+    await downloadTelegramFile(fileUrl.href || String(fileUrl), tempPath);
+    const result = await Tesseract.recognize(tempPath, "eng+rus");
+    const raw = String(result.data.text || "");
+    const candidates = [...raw.matchAll(/(?:итого|к оплате|total|сумма|всего)?[^\d]{0,12}(\d{1,7}[,.]\d{2})/gi)]
+      .map((match) => parseAmount(match[1]))
+      .filter((amount) => amount !== null);
+    const amount = candidates.length ? Math.max(...candidates) : null;
+    if (amount === null) {
+      return ctx.reply("Не смог уверенно распознать итоговую сумму. Отправь более чёткое фото или введи сумму вручную через «➕ Добавить расход».", md(cfg.menuKeyboard));
+    }
+    userSteps.set(userId, { step: "awaiting_category", amount, receiptText: raw.slice(0, 500) });
+    const buttons = cfg.CATEGORIES.map((category) => Markup.button.callback(category.label, `cat:${category.id}`));
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+    return ctx.reply(`🧾 Предполагаемая сумма по чеку: *${formatAmount(amount)}*\nПроверь сумму и выбери категорию:`, md(Markup.inlineKeyboard(rows)));
+  } catch (error) {
+    console.error("Ошибка распознавания чека:", error.message);
+    return ctx.reply("Не удалось обработать чек. Попробуй другое фото или введи сумму вручную.", md(cfg.menuKeyboard));
+  } finally {
+    await fs.unlink(tempPath).catch(() => {});
+  }
+}
+
 async function finishExpense(ctx, comment) {
   const userId = ctx.from.id;
   const state = userSteps.get(userId);
@@ -289,9 +343,9 @@ async function finishExpense(ctx, comment) {
     return ctx.reply("⚠️ Данные расхода некорректны. Попробуй ещё раз.", md(cfg.menuKeyboard));
   }
   const cleanComment = String(comment ?? "").trim().slice(0, MAX_COMMENT_LENGTH) || "Без комментария";
-  await dbRun(`INSERT INTO expenses (user_id, amount, category, comment, user_name, date)
-    VALUES (?, ?, ?, ?, ?, ?)`, [userId, state.amount, state.category, cleanComment,
-    String(ctx.from.first_name || "Пользователь").slice(0, 100), dateInTimezone()]);
+  await dbRun(`INSERT INTO expenses (user_id, amount, category, comment, user_name, date, budget_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`, [userId, state.amount, state.category, cleanComment,
+    String(ctx.from.first_name || "Пользователь").slice(0, 100), dateInTimezone(), state.budgetType === "family" ? "family" : "personal"]);
   const groupId = await getUserGroup(userId);
   userSteps.delete(userId);
   return ctx.reply(groupId
@@ -386,10 +440,32 @@ async function leaveFamilyGroup(ctx) {
 
 bot.start(async (ctx) => ctx.reply(cfg.START_TEXT, md(cfg.menuKeyboard)));
 
+bot.on("photo", async (ctx) => handleReceiptPhoto(ctx));
+
 bot.on("text", async (ctx) => {
   const text = ctx.message.text;
   const userId = ctx.from.id;
   const state = userSteps.get(userId);
+
+  // Quick format: "12,50 продукты хлеб" or "3.50 кофе".
+  if (!state && text !== "➕ Добавить расход" && text !== "📊 Статистика" && text !== "📜 История и удаление" && text !== "⚙️ Настройки") {
+    const quick = quickExpense(text);
+    if (quick) {
+      userSteps.set(userId, { step: "awaiting_category", amount: quick.amount, category: quick.category.label, quickDescription: quick.description });
+      const groupId = await getUserGroup(userId);
+      if (groupId) {
+        userSteps.get(userId).step = "awaiting_budget_type";
+        return ctx.reply(`⚡ Распознал: ${formatAmount(quick.amount)}, ${quick.category.label}, «${quick.description}». Куда записать?`, md(Markup.inlineKeyboard([
+          [Markup.button.callback("👤 Личный бюджет", "budget_personal")],
+          [Markup.button.callback("👥 Семейный бюджет", "budget_family")],
+          [Markup.button.callback("❌ Отмена", "cancel_action")]
+        ])));
+      }
+      userSteps.get(userId).budgetType = "personal";
+      userSteps.get(userId).step = "awaiting_comment";
+      return finishExpense(ctx, quick.description);
+    }
+  }
 
   if (text === "➕ Добавить расход") {
     userSteps.set(userId, { step: "awaiting_amount" });
@@ -407,13 +483,13 @@ bot.on("text", async (ctx) => {
     userSteps.delete(userId);
     const ids = await getGroupIds(userId);
     const placeholders = ids.map(() => "?").join(", ");
-    const rows = await dbAll(`SELECT id, user_id, amount, category, comment, user_name, date
-      FROM expenses WHERE user_id IN (${placeholders}) ORDER BY id DESC LIMIT 5`, ids);
+    const rows = await dbAll(`SELECT id, user_id, amount, category, comment, user_name, date, budget_type
+      FROM expenses WHERE user_id IN (${placeholders}) AND (budget_type = 'family' OR (budget_type = 'personal' AND user_id = ?)) ORDER BY id DESC LIMIT 5`, [...ids, userId]);
     if (!rows.length) return ctx.reply("🌱 История трат пуста.", md(cfg.menuKeyboard));
     await ctx.reply("📋 *Последние 5 расходов:*", md());
     for (const row of rows) {
       const message = `🧾 *${escapeMd(row.category)}*\nСумма: *${formatAmount(row.amount)}*\n` +
-        `📅 Дата: ${escapeMd(row.date)}\n✍️ Кто: ${escapeMd(row.user_name || "Пользователь")}\n📝 ${escapeMd(row.comment || "Без комментария")}`;
+        `📅 Дата: ${escapeMd(row.date)}\n🏷 Бюджет: ${row.budget_type === "family" ? "Семейный" : "Личный"}\n✍️ Кто: ${escapeMd(row.user_name || "Пользователь")}\n📝 ${escapeMd(row.comment || "Без комментария")}`;
       await ctx.reply(message, md(Markup.inlineKeyboard([
         [Markup.button.callback("✏️ Изменить сумму", `edit_expense_${row.id}`)],
         [Markup.button.callback("🗑 Удалить", `delete_${row.id}`)]
@@ -424,13 +500,13 @@ bot.on("text", async (ctx) => {
   if (state?.step === "awaiting_edit_amount") {
     const amount = parseAmount(text);
     if (amount === null) return ctx.reply("⚠️ Введи положительную сумму до 1 000 000 000 ₽. Например: 120 или 120,50.", md(cfg.cancelInline));
-    const expense = await dbGet("SELECT id, user_id FROM expenses WHERE id = ?", [state.expenseId]);
+    const expense = await dbGet("SELECT id, user_id, budget_type FROM expenses WHERE id = ?", [state.expenseId]);
     if (!expense) {
       userSteps.delete(userId);
       return ctx.reply("⚠️ Расход уже не найден. Обнови историю.", md(cfg.menuKeyboard));
     }
     const allowedIds = await getGroupIds(userId);
-    if (!allowedIds.includes(Number(expense.user_id))) {
+    if (Number(expense.user_id) !== Number(userId) && !(expense.budget_type === "family" && allowedIds.includes(Number(expense.user_id)))) {
       userSteps.delete(userId);
       return ctx.reply("⛔ Нет доступа к этому расходу.", md(cfg.menuKeyboard));
     }
@@ -478,10 +554,34 @@ bot.action(/^cat:(.+)$/, async (ctx) => {
   const category = cfg.CATEGORIES.find((item) => item.id === ctx.match[1]);
   if (!category) return ctx.answerCbQuery("Категория не найдена.");
   state.category = category.label;
-  state.step = "awaiting_comment";
   await ctx.answerCbQuery();
+  const groupId = await getUserGroup(ctx.from.id);
+  if (groupId) {
+    state.step = "awaiting_budget_type";
+    return ctx.editMessageText("Куда записать расход?", md(Markup.inlineKeyboard([
+      [Markup.button.callback("👤 Личный бюджет", "budget_personal")],
+      [Markup.button.callback("👥 Семейный бюджет", "budget_family")],
+      [Markup.button.callback("❌ Отмена", "cancel_action")]
+    ])));
+  }
+  state.budgetType = "personal";
+  state.step = "awaiting_comment";
   return ctx.editMessageText("📝 *Введи комментарий к трате или пропусти этот шаг:*", md(cfg.commentInline));
 });
+
+for (const [action, budgetType] of [["budget_personal", "personal"], ["budget_family", "family"]]) {
+  bot.action(action, async (ctx) => {
+    const state = userSteps.get(ctx.from.id);
+    if (!state || state.step !== "awaiting_budget_type") return ctx.answerCbQuery("Начни добавление расхода заново.");
+    if (budgetType === "family" && !(await getUserGroup(ctx.from.id))) return ctx.answerCbQuery("Сначала подключись к семейной группе.", { show_alert: true });
+    state.budgetType = budgetType;
+    state.step = "awaiting_comment";
+    await ctx.answerCbQuery();
+    const comment = state.quickDescription || (state.receiptText ? "Расход по чеку" : "");
+    if (comment) return finishExpense(ctx, comment);
+    return ctx.editMessageText("📝 *Введи комментарий к трате или пропусти этот шаг:*", md(cfg.commentInline));
+  });
+}
 
 bot.action("edit_limit_prompt", async (ctx) => {
   await ctx.answerCbQuery();
@@ -535,10 +635,10 @@ bot.action("cancel_action", async (ctx) => {
 bot.action(/^edit_expense_(\d+)$/, async (ctx) => {
   const userId = ctx.from.id;
   const expenseId = Number(ctx.match[1]);
-  const expense = await dbGet("SELECT id, user_id FROM expenses WHERE id = ?", [expenseId]);
+  const expense = await dbGet("SELECT id, user_id, budget_type FROM expenses WHERE id = ?", [expenseId]);
   if (!expense) return ctx.answerCbQuery("Расход не найден.");
   const allowedIds = await getGroupIds(userId);
-  if (!allowedIds.includes(Number(expense.user_id))) {
+  if (Number(expense.user_id) !== Number(userId) && !(expense.budget_type === "family" && allowedIds.includes(Number(expense.user_id)))) {
     return ctx.answerCbQuery("Нет доступа к этому расходу.", { show_alert: true });
   }
   userSteps.set(userId, { step: "awaiting_edit_amount", expenseId });
@@ -549,10 +649,10 @@ bot.action(/^edit_expense_(\d+)$/, async (ctx) => {
 bot.action(/^delete_(\d+)$/, async (ctx) => {
   const userId = ctx.from.id;
   const expenseId = Number(ctx.match[1]);
-  const expense = await dbGet("SELECT id, user_id FROM expenses WHERE id = ?", [expenseId]);
+  const expense = await dbGet("SELECT id, user_id, budget_type FROM expenses WHERE id = ?", [expenseId]);
   if (!expense) return ctx.answerCbQuery("Расход не найден.");
   const allowedIds = await getGroupIds(userId);
-  if (!allowedIds.includes(Number(expense.user_id))) {
+  if (Number(expense.user_id) !== Number(userId) && !(expense.budget_type === "family" && allowedIds.includes(Number(expense.user_id)))) {
     return ctx.answerCbQuery("Нет доступа к этому расходу.", { show_alert: true });
   }
   await dbRun("DELETE FROM expenses WHERE id = ? AND user_id = ?", [expenseId, expense.user_id]);
