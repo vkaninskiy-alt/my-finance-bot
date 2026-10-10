@@ -237,22 +237,43 @@ async function sendStats(ctx, period = "month", edit = false) {
   const ids = await getGroupIds(userId);
   const limit = await getUserLimit(userId);
   const placeholders = ids.map(() => "?").join(", ");
+  const start = periodStart(selected);
+  const today = dateInTimezone();
   const rows = await dbAll(`SELECT category, SUM(amount) AS total FROM expenses
     WHERE user_id IN (${placeholders}) AND date >= ? AND date <= ?
-    GROUP BY category ORDER BY total DESC`, [...ids, periodStart(selected), dateInTimezone()]);
+    GROUP BY category ORDER BY total DESC`, [...ids, start, today]);
   const total = rows.reduce((sum, row) => sum + Number(row.total || 0), 0);
   const lines = rows.length
     ? rows.map((row) => `${escapeMd(row.category)}: *${formatAmount(row.total)}*`).join("\n")
-    : "🌱 *Траты за выбранный период отсутствуют!*";
-  const remaining = limit - total;
-  const percent = limit > 0 ? Math.round((total / limit) * 100) : 0;
+    : "🌱 *Трат за выбранный период нет.*";
+
+  // The monthly budget is compared only with the current month's spending.
+  const monthStart = `${today.slice(0, 7)}-01`;
+  const previousMonthDate = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 2, 1));
+  const previousMonthStart = `${previousMonthDate.getUTCFullYear()}-${String(previousMonthDate.getUTCMonth() + 1).padStart(2, "0")}-01`;
+  const previousMonthEnd = addDays(monthStart, -1);
+  const monthRow = await dbGet(`SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
+    WHERE user_id IN (${placeholders}) AND date >= ? AND date <= ?`, [...ids, monthStart, today]);
+  const previousRow = await dbGet(`SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
+    WHERE user_id IN (${placeholders}) AND date >= ? AND date <= ?`, [...ids, previousMonthStart, previousMonthEnd]);
+  const monthTotal = Number(monthRow?.total || 0);
+  const previousTotal = Number(previousRow?.total || 0);
+  const remaining = limit - monthTotal;
+  const percent = limit > 0 ? Math.round((monthTotal / limit) * 100) : 0;
   const remainingText = remaining >= 0
-    ? `📉 Осталось бюджета: ${formatAmount(remaining)}`
-    : `⚠️ Лимит превышен на ${formatAmount(Math.abs(remaining))}!`;
+    ? `Осталось: *${formatAmount(remaining)}*`
+    : `⚠️ Превышение: *${formatAmount(Math.abs(remaining))}*`;
+  const comparison = previousTotal > 0
+    ? (monthTotal <= previousTotal
+      ? `📉 К прошлому месяцу: на ${Math.round((1 - monthTotal / previousTotal) * 100)}% меньше`
+      : `📈 К прошлому месяцу: на ${Math.round((monthTotal / previousTotal - 1) * 100)}% больше`)
+    : "📊 В прошлом месяце расходов не было.";
   const title = groupId ? "🧾 *Семейный отчёт*" : "🧾 *Ваш отчёт*";
+  const budgetLines = selected === "month"
+    ? `💰 Месячный лимит: *${formatAmount(limit)}*\n${remainingText}\n📊 Использовано: *${percent}%*\n${comparison}`
+    : `💰 Потрачено за период: *${formatAmount(total)}*\nℹ️ Месячный лимит и остаток рассчитываются отдельно за текущий месяц.`;
   const message = `${title}\n📆 Период: *${PERIODS[selected].label}*\n${cfg.DIVIDER}\n${lines}\n${cfg.DIVIDER}\n` +
-    `💰 Месячный лимит: ${formatAmount(limit)}\n${remainingText}\n` +
-    `📊 Потрачено за период от месячного лимита: ${percent}%`;
+    `💸 Всего за период: *${formatAmount(total)}*\n${budgetLines}`;
   if (edit && ctx.callbackQuery) return ctx.editMessageText(message, md(statsKeyboard()));
   return ctx.reply(message, md(statsKeyboard()));
 }
@@ -393,9 +414,29 @@ bot.on("text", async (ctx) => {
     for (const row of rows) {
       const message = `🧾 *${escapeMd(row.category)}*\nСумма: *${formatAmount(row.amount)}*\n` +
         `📅 Дата: ${escapeMd(row.date)}\n✍️ Кто: ${escapeMd(row.user_name || "Пользователь")}\n📝 ${escapeMd(row.comment || "Без комментария")}`;
-      await ctx.reply(message, md(Markup.inlineKeyboard([[Markup.button.callback("🗑 Удалить", `delete_${row.id}`)]])));
+      await ctx.reply(message, md(Markup.inlineKeyboard([
+        [Markup.button.callback("✏️ Изменить сумму", `edit_expense_${row.id}`)],
+        [Markup.button.callback("🗑 Удалить", `delete_${row.id}`)]
+      ])));
     }
     return;
+  }
+  if (state?.step === "awaiting_edit_amount") {
+    const amount = parseAmount(text);
+    if (amount === null) return ctx.reply("⚠️ Введи положительную сумму до 1 000 000 000 ₽. Например: 120 или 120,50.", md(cfg.cancelInline));
+    const expense = await dbGet("SELECT id, user_id FROM expenses WHERE id = ?", [state.expenseId]);
+    if (!expense) {
+      userSteps.delete(userId);
+      return ctx.reply("⚠️ Расход уже не найден. Обнови историю.", md(cfg.menuKeyboard));
+    }
+    const allowedIds = await getGroupIds(userId);
+    if (!allowedIds.includes(Number(expense.user_id))) {
+      userSteps.delete(userId);
+      return ctx.reply("⛔ Нет доступа к этому расходу.", md(cfg.menuKeyboard));
+    }
+    await dbRun("UPDATE expenses SET amount = ? WHERE id = ?", [amount, state.expenseId]);
+    userSteps.delete(userId);
+    return ctx.reply(`✅ Сумма расхода обновлена: *${formatAmount(amount)}*`, md(cfg.menuKeyboard));
   }
   if (state?.step === "awaiting_amount") {
     const amount = parseAmount(text);
@@ -489,6 +530,20 @@ bot.action("cancel_action", async (ctx) => {
   userSteps.delete(ctx.from.id);
   await ctx.answerCbQuery();
   return ctx.reply("Действие отменено.", md(cfg.menuKeyboard));
+});
+
+bot.action(/^edit_expense_(\d+)$/, async (ctx) => {
+  const userId = ctx.from.id;
+  const expenseId = Number(ctx.match[1]);
+  const expense = await dbGet("SELECT id, user_id FROM expenses WHERE id = ?", [expenseId]);
+  if (!expense) return ctx.answerCbQuery("Расход не найден.");
+  const allowedIds = await getGroupIds(userId);
+  if (!allowedIds.includes(Number(expense.user_id))) {
+    return ctx.answerCbQuery("Нет доступа к этому расходу.", { show_alert: true });
+  }
+  userSteps.set(userId, { step: "awaiting_edit_amount", expenseId });
+  await ctx.answerCbQuery();
+  return ctx.reply("✏️ *Введи новую сумму расхода:*", md(cfg.cancelInline));
 });
 
 bot.action(/^delete_(\d+)$/, async (ctx) => {
